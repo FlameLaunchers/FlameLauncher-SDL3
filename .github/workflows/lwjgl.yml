@@ -1,0 +1,82 @@
+name: LWJGL natives
+
+# SDL3 워크플로와 같은 이유로 macOS 러너에서 양쪽을 다 만든다.
+# libffi 를 소스에서 빌드하므로 automake/libtool 이 필요하고, jni.h 를 위해 JDK 가 필요하다.
+on:
+  workflow_dispatch:
+    inputs:
+      lwjgl_ref:
+        description: 'LWJGL 태그 (예: 3.4.3)'
+        required: false
+        default: '3.4.3'
+      tag:
+        description: '릴리스 태그 (예: lwjgl-v3.4.3-1). 비우면 빌드만 한다'
+        required: false
+  push:
+    tags: ['lwjgl-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: brew install automake libtool
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: LWJGL 네이티브 빌드 (iOS)
+        run: ./Scripts/build-lwjgl-natives.sh "${{ inputs.lwjgl_ref || '3.4.3' }}"
+
+      - name: LWJGL 네이티브 빌드 (Android)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./Scripts/build-lwjgl-natives-android.sh "${{ inputs.lwjgl_ref || '3.4.3' }}"
+
+      # 플랫폼마다 파일이 네 개씩이라 묶어서 올린다.
+      - name: 자산 정리
+        run: |
+          mkdir -p dist
+          (cd Runtime/Frameworks341 && zip -qry "$GITHUB_WORKSPACE/dist/lwjgl-ios-arm64.zip" .)
+          (cd Runtime/lwjgl341/android/arm64-v8a && zip -qry "$GITHUB_WORKSPACE/dist/lwjgl-android-arm64-v8a.zip" .)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lwjgl-natives
+          path: dist/*
+
+      - name: 릴리스
+        if: startsWith(github.ref, 'refs/tags/lwjgl-v') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          REF="${{ inputs.lwjgl_ref || '3.4.3' }}"
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LWJGL ${REF} natives" \
+            --notes "LWJGL \`${REF}\` natives for mobile, built from source (libffi is built too and linked statically into \`liblwjgl\`).
+
+| Asset | Contents |
+|---|---|
+| \`lwjgl-ios-arm64.zip\` | \`liblwjgl\`, \`liblwjgl_opengl\`, \`liblwjgl_stb\`, \`liblwjgl_tinyfd\` (.dylib) |
+| \`lwjgl-android-arm64-v8a.zip\` | \`liblwjgl\`, \`liblwjgl_opengl\`, \`liblwjgl_stb\`, \`liblwjgl_vma\` (.so) |
+
+The jar and the natives have to be the same version — a 3.4.3 jar on 3.4.1 natives dies in class init with \`UnsatisfiedLinkError: MemoryUtil.ngetPageSize()\`." \
+            || gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

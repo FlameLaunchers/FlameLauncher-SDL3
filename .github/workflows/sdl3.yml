@@ -1,0 +1,76 @@
+name: SDL3
+
+# ⚠️ macOS 러너에서 **양쪽 다** 만든다. iOS 는 Xcode 가 필요하고, 스크립트가
+#    `sysctl -n hw.ncpu` 와 NDK 의 darwin-x86_64 툴체인을 쓰기 때문에 안드로이드도
+#    여기서 돌린다(리눅스에서 돌리려면 스크립트부터 손봐야 한다).
+on:
+  workflow_dispatch:
+    inputs:
+      sdl_ref:
+        description: 'SDL 업스트림 태그 (예: release-3.4.16)'
+        required: false
+        default: 'release-3.4.16'
+      tag:
+        description: '릴리스 태그 (예: sdl3-v3.4.16-1). 비우면 빌드만 하고 릴리스는 안 만든다'
+        required: false
+  push:
+    tags: ['sdl3-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: brew install ninja
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: SDL3 빌드 (iOS · Android)
+        env:
+          SDL_REF: ${{ inputs.sdl_ref || 'release-3.4.16' }}
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./Scripts/build-sdl3.sh all
+
+      # 릴리스 자산은 어느 플랫폼 것인지 이름만 보고 알 수 있어야 한다.
+      - name: 자산 정리
+        run: |
+          mkdir -p dist
+          cp Runtime/SDL3/libSDL3.dylib                       dist/libSDL3-ios-arm64.dylib
+          cp Runtime/SDL3/android/arm64-v8a/libSDL3.so        dist/libSDL3-android-arm64-v8a.so
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdl3-natives
+          path: dist/*
+
+      - name: 릴리스
+        if: startsWith(github.ref, 'refs/tags/sdl3-v') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          SDL_REF="${{ inputs.sdl_ref || 'release-3.4.16' }}"
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SDL3 ${SDL_REF}" \
+            --notes "Built from SDL \`${SDL_REF}\` with the mobile patches in \`Scripts/build-sdl3.sh\` (see the README for what each one fixes).
+
+| Asset | Platform |
+|---|---|
+| \`libSDL3-ios-arm64.dylib\` | iOS arm64 |
+| \`libSDL3-android-arm64-v8a.so\` | Android arm64-v8a |
+
+Point LWJGL at it with \`-Dorg.lwjgl.sdl.libname=<absolute path>\`; \`org.lwjgl.sdl.SDL\` opens the file, it does not look for symbols." \
+            || gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
