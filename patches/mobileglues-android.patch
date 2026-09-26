@@ -1,0 +1,243 @@
+Android MobileGlues patch (jniLibs/arm64-v8a/libmobileglues.so) for Minecraft 26.3 shaders on Mali.
+Base: MobileGL-Dev/MobileGlues @ fbc4e412e353302607ba36489b2dd573b5becb25
+Apply: git apply mobileglues-android.patch, then build with NDK CMake (arm64-v8a).
+
+diff --git a/MobileGlues-cpp/egl/egl.cpp b/MobileGlues-cpp/egl/egl.cpp
+index 61b2759..173115f 100644
+--- a/MobileGlues-cpp/egl/egl.cpp
++++ b/MobileGlues-cpp/egl/egl.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ // MobileGlues - egl/egl.cpp
+ // Copyright (c) 2025-2026 MobileGL-Dev
+ // Licensed under the GNU Lesser General Public License v2.1:
+@@ -402,16 +403,23 @@ namespace {
+         return fn;
+     }
+ 
++    // FlameLauncher: 성공한 스왑 수. 런처가 "첫 프레임이 나왔는가"를 이걸로 안다
++    // (SDL 을 UI 스레드에서 건드리면 게임 스레드와 락이 엉키므로, 여기서 센다).
++    std::atomic<unsigned> flame_mg_swaps{0};
++
+     // ApplyFSR upscales into the surface, the swap presents it, the resolution
+     // check reacts to a surface that has changed size. The three belong together,
+     // and every path that presents a frame has to go through here.
+     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
+         LOAD_EGL(eglSwapBuffers)
+         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
+-            return egl_eglSwapBuffers(dpy, surface);
++            const EGLBoolean r = egl_eglSwapBuffers(dpy, surface);
++            if (r == EGL_TRUE) flame_mg_swaps.fetch_add(1, std::memory_order_relaxed);
++            return r;
+         }
+         ApplyFSR();
+         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
++        if (result == EGL_TRUE) flame_mg_swaps.fetch_add(1, std::memory_order_relaxed);
+         CheckResolutionChange(dpy, surface);
+         return result;
+     }
+@@ -792,6 +800,7 @@ extern "C"
+         LOAD_EGL(eglMakeCurrent)
+         MGContext* before = mg_context_find(ctx);
+         const EGLBoolean result = egl_eglMakeCurrent(dpy, draw, read, ctx);
++
+         ETRACE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p, MGContext=%llu) -> %s", dpy, draw, read, ctx,
+                before ? before->id : 0ULL, result == EGL_TRUE ? "ok" : "FAILED");
+         // Only on success: a failed make-current leaves the previous context
+@@ -1072,3 +1081,9 @@ extern "C"
+         return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(glXGetProcAddress(procname));
+     }
+ }
++
++
++// FlameLauncher: 런처가 dlsym 으로 부른다.
++extern "C" __attribute__((visibility("default"))) unsigned flame_mg_swap_count() {
++    return flame_mg_swaps.load(std::memory_order_relaxed);
++}
+diff --git a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+index c7eee88..62c44ec 100644
+--- a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
++++ b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+@@ -248,8 +248,21 @@ std::string process_uniform_declarations(const std::string& glslCode) {
+ 
+     result.reserve(glslCode.length());
+ 
++    // "uniform" 은 **낱말일 때만** 선언의 시작이다.
++    // 앞뒤가 식별자 문자면 그건 이름의 일부다 — SPIRV-Cross 가 내는
++    // `_uniform_instance_00_01` 같은 이름이 그렇다. 그걸 선언으로 잘못 보면
++    // 다음 ';' 까지를 통째로 갈아엎어 코드가 깨진다(마인크래프트 26.3 에서 실측:
++    // `if (_uniform_instance_00_01.Flag) { ... }` → `if (_uniform _instance_00_01 ;`).
++    auto is_ident_char = [](char c) {
++        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
++    };
++
+     while (scan_pos < length) {
+-        if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
++        const bool is_uniform_token =
++            glslCode.compare(scan_pos, 7, "uniform") == 0 &&
++            (scan_pos == 0 || !is_ident_char(glslCode[scan_pos - 1])) &&
++            (scan_pos + 7 >= length || !is_ident_char(glslCode[scan_pos + 7]));
++        if (is_uniform_token) {
+             if (scan_pos > chunk_start) {
+                 result.append(glslCode, chunk_start, scan_pos - chunk_start);
+             }
+@@ -346,6 +359,108 @@ std::string processOutColorLocations(const std::string& glslCode) {
+     return std::regex_replace(glslCode, pattern, replacement);
+ }
+ 
++
++// ── 프래그먼트 출력 배열의 동적 인덱싱 풀기 ────────────────────────────────
++//
++// GLSL ES 는 `out vec4 color[N]` 을 **상수로만** 인덱싱하게 한다(S0015). 그런데
++// 마인크래프트 26.3 의 셰이더는 상수 범위 반복문 안에서 변수로 인덱싱한다:
++//
++//     for (int attachmentIndex = 0; attachmentIndex < 2; attachmentIndex++)
++//         for (int i_1 = 0; i_1 < 4; i_1++)
++//             _frag_output_00[attachmentIndex][i_1] = coefficients[...];
++//
++// 범위가 리터럴이므로 펼치면 인덱스가 상수가 된다. 출력 배열을 건드리는 반복문만,
++// 그리고 SPIRV-Cross 가 내는 정형화된 형태일 때만 손댄다 — 그 외에는 그대로 둔다.
++static std::vector<std::string> flame_out_array_names(const std::string& code) {
++    static const std::regex decl(
++        R"(out\s+(?:highp\s+|mediump\s+|lowp\s+)?\w+\s+(\w+)\s*\[\s*\d+\s*\]\s*;)");
++    std::vector<std::string> names;
++    for (std::sregex_iterator it(code.begin(), code.end(), decl), end; it != end; ++it)
++        names.push_back((*it)[1].str());
++    return names;
++}
++
++static bool flame_body_indexes_out_array(const std::string& body, const std::vector<std::string>& names,
++                                         const std::string& var) {
++    if (body.find(var) == std::string::npos) return false;
++    for (const auto& n : names) {
++        size_t at = body.find(n + "[");
++        if (at != std::string::npos) return true;
++    }
++    return false;
++}
++
++static std::string flame_replace_word(const std::string& text, const std::string& word, const std::string& with) {
++    std::string out;
++    out.reserve(text.size());
++    size_t pos = 0;
++    auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
++    while (true) {
++        size_t at = text.find(word, pos);
++        if (at == std::string::npos) {
++            out.append(text, pos, std::string::npos);
++            return out;
++        }
++        const bool left = at > 0 && ident(text[at - 1]);
++        const size_t after = at + word.size();
++        const bool right = after < text.size() && ident(text[after]);
++        out.append(text, pos, at - pos);
++        out.append((left || right) ? word : with);
++        pos = after;
++    }
++}
++
++std::string unroll_out_array_loops(const std::string& glslCode) {
++    const std::vector<std::string> names = flame_out_array_names(glslCode);
++    if (names.empty()) return glslCode;
++
++    // `for (int NAME = 0; NAME < K; NAME++)` — SPIRV-Cross 가 내는 형태 그대로.
++    static const std::regex loop(
++        R"(for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*(\d+)\s*;\s*(?:\1\s*\+\+|\+\+\s*\1)\s*\)\s*\{)");
++
++    std::string code = glslCode;
++    for (int pass = 0; pass < 8; ++pass) {   // 중첩 반복문은 바깥부터 한 겹씩
++        std::smatch m;
++        bool changed = false;
++        size_t from = 0;
++        while (std::regex_search(code.cbegin() + from, code.cend(), m, loop)) {
++            const size_t head = from + m.position(0);
++            const size_t body_start = from + m.position(0) + m.length(0);   // '{' 다음
++            const std::string var = m[1].str();
++            const int count = std::stoi(m[2].str());
++
++            // 짝이 맞는 '}' 찾기
++            int depth = 1;
++            size_t i = body_start;
++            for (; i < code.size() && depth > 0; ++i) {
++                if (code[i] == '{') ++depth;
++                else if (code[i] == '}') --depth;
++            }
++            if (depth != 0) break;
++            const size_t body_end = i - 1;   // '}' 위치
++            const std::string body = code.substr(body_start, body_end - body_start);
++
++            if (count > 0 && count <= 64 && flame_body_indexes_out_array(body, names, var)) {
++                std::string unrolled;
++                unrolled.reserve(body.size() * count + 16);
++                for (int k = 0; k < count; ++k) {
++                    unrolled += "\n{";
++                    unrolled += flame_replace_word(body, var, std::to_string(k));
++                    unrolled += "}\n";
++                }
++                code = code.substr(0, head) + unrolled + code.substr(body_end + 1);
++                changed = true;
++                from = head + unrolled.size();
++            } else {
++                from = body_end;
++            }
++            if (from >= code.size()) break;
++        }
++        if (!changed) break;
++    }
++    return code;
++}
++
+ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
+                          int& return_code) {
+     std::string sha256_string(glsl_code);
+@@ -364,6 +479,7 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
+     std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
+     if (return_code >= 0 && !converted.empty()) {
+         converted = process_uniform_declarations(converted);
++        converted = unroll_out_array_loops(converted);
+         Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
+     }
+ 
+diff --git a/MobileGlues-cpp/gl/shader.cpp b/MobileGlues-cpp/gl/shader.cpp
+index cf4043d..ea23457 100644
+--- a/MobileGlues-cpp/gl/shader.cpp
++++ b/MobileGlues-cpp/gl/shader.cpp
+@@ -23,6 +23,22 @@ struct shader_t shaderInfo;
+ 
+ UnorderedMap<GLuint, bool> shader_map_is_sampler_buffer_emulated;
+ 
++// ── FlameLauncher 진단용 ────────────────────────────────────────────────────
++// 변환 결과를 셰이더별로 들고 있다가, 컴파일이 실패하면 MG 폴더에 그대로 떨군다.
++// (로그만으로는 몇 번째 줄이 왜 깨졌는지 알 수 없다 — 마인크래프트 26.3 추적용)
++#include <fstream>
++#include "../config/config.h"
++static UnorderedMap<GLuint, std::string> flame_converted_src;
++
++static void flame_dump_failed_shader(GLuint shader) {
++    auto it = flame_converted_src.find(shader);
++    if (it == flame_converted_src.end()) return;
++    std::string path = std::string(mg_directory_path ? mg_directory_path : ".")
++                       + "/failed_shader_" + std::to_string(shader) + ".glsl";
++    std::ofstream out(path, std::ios::trunc);
++    if (out) out << it->second;
++}
++
+ bool can_run_essl3(unsigned int esversion, const char* glsl) {
+     if (strncmp(glsl, "#version 100", 12) == 0) {
+         return true;
+@@ -98,6 +114,7 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, c
+     if (!essl_src.empty()) {
+         shaderInfo.id = shader;
+         shaderInfo.converted = essl_src;
++        flame_converted_src[shader] = essl_src;
+         const char* s[] = {essl_src.c_str()};
+         GLES.glShaderSource(shader, count, s, nullptr);
+         if (hardware->emulate_texture_buffer)
+@@ -114,6 +131,7 @@ void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
+         GLchar infoLog[512];
+         GLES.glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+         LOG_W_FORCE("Shader %d compilation failed: \n%s", shader, infoLog)
++        flame_dump_failed_shader(shader);
+         LOG_W_FORCE("Now try to cheat.")
+         *params = GL_TRUE;
+     }

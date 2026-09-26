@@ -1,0 +1,78 @@
+FlameLauncher Natives
+Copyright (C) 2026 Donghyun Yang
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE for the full text.
+
+
+WHAT THIS REPOSITORY CONTAINS
+=============================
+
+Build scripts only. No upstream source is vendored here. Each script clones its
+upstream at build time, applies its patches, and builds -- so what this
+repository holds is the *diff*, not the code being patched.
+
+
+WHY AGPL-3.0
+============
+
+A patch is a derivative of the file it modifies and carries that file's licence.
+This repository patches works under several licences at once, so the repository
+as a whole is distributed under the strongest of them -- Terracotta's AGPL-3.0.
+
+    Script                    Upstream                Upstream licence
+    ------------------------  ----------------------  -------------------
+    build-mobileglues.sh      MobileGlues             LGPL-2.1-only
+    build-terracotta.sh       Terracotta-lib          AGPL-3.0
+                              EasyTier                LGPL-3.0
+    build-javaapp.sh          Amethyst-iOS            GPL-3.0
+                              LWJGL                   BSD-3-Clause
+    build-lwjgl-natives.sh    LWJGL                   BSD-3-Clause
+                              libffi                  MIT
+    build-spirv-cross.sh      SPIRV-Cross             Apache-2.0
+    build-sdl3.sh             SDL                     Zlib
+    build-shaderc.sh          shaderc                 Apache-2.0
+                              glslang                 BSD-3-Clause and others
+                              SPIRV-Tools             Apache-2.0
+
+If you want a single patch on its own terms, the patch to a MobileGlues file is
+equally available to you under LGPL-2.1-only, and the patch to an Amethyst-iOS
+file under GPL-3.0 -- each matching the file it modifies. AGPL-3.0 applies to
+the collection.
+
+
+build-shaderc.sh builds its upstreams without modifying them; glslang and
+SPIRV-Tools come in through shaderc's own pinned dependency set.
+
+
+WHERE TO FIND THINGS
+====================
+
+    patches/     The complete diff each script produces, as readable unified
+                 diffs. This is the "modified module" in the form that matters:
+                 vendoring the patched upstream trees whole would be hundreds of
+                 megabytes, most of it unchanged. Regenerate with
+                 EMIT_PATCH_DIR=<dir> ./Scripts/build-<name>.sh
+
+    licenses/    The full licence text of every upstream this repository
+                 patches, copied verbatim from each project.
+
+    Scripts/     The build scripts themselves. CI runs exactly these.
+
+
+ANCHOR STRINGS
+==============
+
+Each patch locates its insertion point by matching a short excerpt of the
+upstream file, then asserts that the excerpt was found. Those excerpts are
+quoted from the upstream sources listed above and are reproduced here only to
+identify a position in a file.
+
+
+TRADEMARKS
+==========
+
+Minecraft is a trademark of Mojang AB. This project is not affiliated with,
+endorsed by, or connected to Mojang AB or Microsoft.

@@ -1,0 +1,15 @@
+diff --git a/easytier/src/common/network.rs b/easytier/src/common/network.rs
+index ac8061d..ce69cb1 100644
+--- a/easytier/src/common/network.rs
++++ b/easytier/src/common/network.rs
+@@ -16,7 +16,9 @@ struct InterfaceFilter {
+     iface: NetworkInterface,
+ }
+ 
+-#[cfg(any(target_os = "android", target_env = "ohos"))]
++// iOS 는 안드로이드와 같은 길로 간다. macOS 구현은 `networksetup` CLI 를 부르는데
++// iOS 엔 그 명령이 없고, 모바일에서는 인터페이스를 걸러낼 수단도 없다 — 전부 받는다.
++#[cfg(any(target_os = "android", target_env = "ohos", target_os = "ios"))]
+ impl InterfaceFilter {
+     async fn filter_iface(&self) -> bool {
+         true

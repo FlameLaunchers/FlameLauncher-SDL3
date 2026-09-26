@@ -1,0 +1,1060 @@
+diff --git a/MobileGlues-cpp/CMakeLists.txt b/MobileGlues-cpp/CMakeLists.txt
+index 0426186..f5be020 100644
+--- a/MobileGlues-cpp/CMakeLists.txt
++++ b/MobileGlues-cpp/CMakeLists.txt
+@@ -149,7 +149,9 @@ if (NOT MSVC)
+     # calls bind to changes. On the target, not in the AppleClang-guarded block
+     # above -- that block's condition has never been true (dangling NOT MATCHES),
+     # which is also why --gc-sections never made it into the link.
+-    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
++    if(NOT APPLE)
++        target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
++    endif()
+ endif()
+ 
+ if(MACOS)
+diff --git a/MobileGlues-cpp/config/settings.cpp b/MobileGlues-cpp/config/settings.cpp
+index 43d5dd0..bff2d75 100644
+--- a/MobileGlues-cpp/config/settings.cpp
++++ b/MobileGlues-cpp/config/settings.cpp
+@@ -33,6 +33,21 @@ void init_settings() {
+     global_settings.fsr1_setting = FSR1_Quality_Preset::Disabled;
+     global_settings.hide_mg_env_level = HideMGEnvLevel::Disabled;
+ 
++    // ⚠️ 위는 전부 하드코딩이라 config.json 이 통째로 무시된다. 런처가 런타임에 바꿔야 하는
++    //    값만 여기서 덮어쓴다. 키가 없거나(-1) 파일이 없으면 위 기본값 그대로 간다.
++    //
++    //    ext_direct_state_access 가 특히 중요하다: 켜져 있으면 MobileGlues 가
++    //    GL_ARB_direct_state_access 를 광고하고, Iris 가 그걸 보고 DSA 경로
++    //    (glNamedFramebufferTexture → glFramebufferTexture)를 탄다. 그런데
++    //    glFramebufferTexture 는 ES 3.2 진입점이고 ANGLE Metal 은 ES 3.0 이다.
++    if (initialized || config_refresh()) {
++        int dsa = config_get_int("enableExtDirectStateAccess");
++        if (dsa >= 0) global_settings.ext_direct_state_access = (dsa > 0);
++
++        int computeShader = config_get_int("enableExtComputeShader");
++        if (computeShader >= 0) global_settings.ext_compute_shader = (computeShader > 0);
++    }
++
+ #else
+ 
+     int success = initialized;
+diff --git a/MobileGlues-cpp/egl/egl.cpp b/MobileGlues-cpp/egl/egl.cpp
+index 61b2759..95993d9 100644
+--- a/MobileGlues-cpp/egl/egl.cpp
++++ b/MobileGlues-cpp/egl/egl.cpp
+@@ -373,6 +373,10 @@ namespace {
+ 
+         rewritten.push_back(EGL_CONTEXT_CLIENT_VERSION);
+         rewritten.push_back(kBackendDesktopGlClientVersion);
++        // ⚠️ 마이너 버전을 안 주면 EGL 기본값 0 → ES 3.0 이 나온다. 데스크톱 GL 을
++        //    흉내내려면 3.1/3.2 기능이 필요하므로 최대치를 요청한다(아래에서 폴백).
++        rewritten.push_back(EGL_CONTEXT_MINOR_VERSION);
++        rewritten.push_back(2);
+         rewritten.push_back(EGL_NONE);
+         *backend_attributes = std::move(rewritten);
+         return true;
+@@ -760,6 +764,15 @@ extern "C"
+ 
+         std::lock_guard<std::mutex> lifecycle(context_lifecycle_mutex);
+         EGLContext context = egl_eglCreateContext(dpy, config, share_context, backend_attributes.data());
++        // 3.2 를 못 주는 호스트면 3.1 → 3.0 으로 내려간다. 마이너 버전은 항상 마지막에서
++        // 두 번째 값이다(바로 위에서 EGL_NONE 직전에 넣었다).
++        if (context == EGL_NO_CONTEXT && backend_attributes.size() >= 2) {
++            EGLint& minor = backend_attributes[backend_attributes.size() - 2];
++            for (EGLint want = 1; context == EGL_NO_CONTEXT && want >= 0; --want) {
++                minor = want;
++                context = egl_eglCreateContext(dpy, config, share_context, backend_attributes.data());
++            }
++        }
+         ETRACE("eglCreateContext(desktop, dpy=%p, share=%p) -> %p, granted %d.%d [backend attrs: %s]", dpy,
+                share_context, context, frontend_major, frontend_minor, describeAttributes(backend_attributes).c_str());
+         if (context != EGL_NO_CONTEXT) {
+diff --git a/MobileGlues-cpp/egl/loader.cpp b/MobileGlues-cpp/egl/loader.cpp
+index 7f957f3..ca3d423 100644
+--- a/MobileGlues-cpp/egl/loader.cpp
++++ b/MobileGlues-cpp/egl/loader.cpp
+@@ -52,7 +52,7 @@ void init_target_egl() {
+                               EGL_OPENGL_ES3_BIT,
+                               EGL_NONE};
+ 
+-    EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
++    EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE};
+ 
+     EGLint pbAttribs[] = {EGL_WIDTH, 32, EGL_HEIGHT, 32, EGL_NONE};
+ 
+@@ -102,6 +102,11 @@ void init_target_egl() {
+     }
+ 
+     eglContext = egl_eglCreateContext(eglDisplay, pbufConfig, EGL_NO_CONTEXT, ctxAttribs);
++    // 3.2 를 안 주는 호스트면 3.1, 그것도 안 되면 3.0 으로 내려간다.
++    for (EGLint minor = 1; eglContext == EGL_NO_CONTEXT && minor >= 0; --minor) {
++        ctxAttribs[3] = minor;
++        eglContext = egl_eglCreateContext(eglDisplay, pbufConfig, EGL_NO_CONTEXT, ctxAttribs);
++    }
+     if (eglContext == EGL_NO_CONTEXT) {
+         LOG_E("eglCreateContext failed (0x%x)", egl_eglGetError());
+         goto cleanup;
+diff --git a/MobileGlues-cpp/egl/trace.h b/MobileGlues-cpp/egl/trace.h
+index 61cf26f..cbf4a43 100644
+--- a/MobileGlues-cpp/egl/trace.h
++++ b/MobileGlues-cpp/egl/trace.h
+@@ -30,12 +30,20 @@
+ // release build on a user's device, without GLOBAL_DEBUG turning the whole
+ // renderer into a log firehose that drops the interesting lines. Set MG_EGL_TRACE
+ // to 0 to compile all of it out.
++#include <pthread.h>
++
+ #define MG_EGL_TRACE 0
+ 
+ // A thread id, via the syscall rather than gettid(), which bionic only exposes as
+ // a real symbol from API 30 and this library targets 21.
+ static inline int mg_egl_tid(void) {
++#ifdef __APPLE__
++    uint64_t tid = 0;
++    pthread_threadid_np(NULL, &tid);
++    return (int)tid;
++#else
+     return (int)syscall(__NR_gettid);
++#endif
+ }
+ 
+ #if MG_EGL_TRACE
+diff --git a/MobileGlues-cpp/gl/drawing.cpp b/MobileGlues-cpp/gl/drawing.cpp
+index d3c9619..403f153 100644
+--- a/MobileGlues-cpp/gl/drawing.cpp
++++ b/MobileGlues-cpp/gl/drawing.cpp
+@@ -114,7 +114,7 @@ const resolved_program_t& resolve_program(GLuint program) {
+                 GLenum type = 0;
+                 GLES.glGetActiveUniform(program, i, bufSize, &length, &size, &type, name);
+ 
+-                if (type == GL_SAMPLER_2D || type == GL_INT_SAMPLER_2D) {
++                if (type == GL_INT_SAMPLER_2D) {   // FlameLauncher: sampler2D 는 건드리지 않는다
+                     built.samplers.push_back(GLES.glGetUniformLocation(program, name));
+                 }
+             }
+@@ -193,7 +193,90 @@ void setupBufferTextureUniforms(GLuint program) {
+     GLES.glUniform1i(info.locHeight, texObject->height);
+ }
+ 
++// GL 은 정수 정점 속성의 부호가 셰이더 선언과 달라도 받아주지만 Metal 은 아니다.
++static GLenum mg_match_sign(GLenum type, bool want_signed) {
++    if (want_signed) switch (type) {
++        case GL_UNSIGNED_BYTE: return GL_BYTE;
++        case GL_UNSIGNED_SHORT: return GL_SHORT;
++        case GL_UNSIGNED_INT: return GL_INT;
++        default: return type;
++    }
++    switch (type) {
++        case GL_BYTE: return GL_UNSIGNED_BYTE;
++        case GL_SHORT: return GL_UNSIGNED_SHORT;
++        case GL_INT: return GL_UNSIGNED_INT;
++        default: return type;
++    }
++}
++
++// 프로그램의 정수 속성 목록: (위치, 셰이더가 부호 있는 타입으로 선언했는가).
++// 링크 결과에만 의존하므로 프로그램당 한 번만 만든다.
++static const std::vector<std::pair<GLint, bool>>& mg_integer_attributes(GLuint program) {
++    static UnorderedMap<GLuint, std::vector<std::pair<GLint, bool>>> cache;
++    auto it = cache.find(program);
++    if (it != cache.end()) return it->second;
++
++    std::vector<std::pair<GLint, bool>> list;
++    GLint nattr = 0, maxlen = 0;
++    GLES.glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &nattr);
++    GLES.glGetProgramiv(program, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &maxlen);
++    std::vector<char> name((size_t)(maxlen > 0 ? maxlen : 64) + 1);
++    for (GLint i = 0; i < nattr; i++) {
++        GLsizei len = 0;
++        GLint size = 0;
++        GLenum type = 0;
++        GLES.glGetActiveAttrib(program, (GLuint)i, (GLsizei)name.size(), &len, &size, &type, name.data());
++        bool is_signed;
++        switch (type) {
++            case GL_INT: case GL_INT_VEC2: case GL_INT_VEC3: case GL_INT_VEC4:
++                is_signed = true;
++                break;
++            case GL_UNSIGNED_INT: case GL_UNSIGNED_INT_VEC2:
++            case GL_UNSIGNED_INT_VEC3: case GL_UNSIGNED_INT_VEC4:
++                is_signed = false;
++                break;
++            default:
++                continue;   // 실수형 속성은 Metal 이 알아서 변환한다
++        }
++        GLint loc = GLES.glGetAttribLocation(program, name.data());
++        if (loc >= 0) list.emplace_back(loc, is_signed);
++    }
++    return cache.emplace(program, std::move(list)).first->second;
++}
++
++// 부호가 어긋난 정수 속성을 셰이더 쪽 부호로 다시 지정한다.
++// 값 자체는 그대로다 — 같은 비트를 어떻게 읽을지만 바뀐다.
++static void mg_fix_integer_attribute_signedness(GLuint program) {
++    const auto& attrs = mg_integer_attributes(program);
++    if (attrs.empty()) return;
++
++    GLint saved_array_buffer = -1;
++    for (const auto& entry : attrs) {
++        const GLint loc = entry.first;
++        GLint integer = 0, type = 0;
++        GLES.glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &integer);
++        if (!integer) continue;   // glVertexAttribPointer 로 지정된 것은 건드리지 않는다
++        GLES.glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
++        const GLenum fixed = mg_match_sign((GLenum)type, entry.second);
++        if (fixed == (GLenum)type) continue;
++
++        GLint size = 0, stride = 0, buffer = 0;
++        void* offset = nullptr;
++        GLES.glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
++        GLES.glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
++        GLES.glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
++        GLES.glGetVertexAttribPointerv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &offset);
++        if (!buffer) continue;    // 클라이언트 배열은 VAO 안에서 어차피 못 쓴다
++
++        if (saved_array_buffer < 0) GLES.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_array_buffer);
++        GLES.glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buffer);
++        GLES.glVertexAttribIPointer((GLuint)loc, size, fixed, stride, offset);
++    }
++    if (saved_array_buffer >= 0) GLES.glBindBuffer(GL_ARRAY_BUFFER, (GLuint)saved_array_buffer);
++}
++
+ void prepareForDraw() {
++    if (gl_state->current_program) mg_fix_integer_attribute_signedness(gl_state->current_program);
+     LOG_D("prepareForDraw...")
+     if (hardware->emulate_texture_buffer) {
+         setupBufferTextureUniforms(gl_state->current_program);
+diff --git a/MobileGlues-cpp/gl/framebuffer.cpp b/MobileGlues-cpp/gl/framebuffer.cpp
+index cb2585a..925bc27 100644
+--- a/MobileGlues-cpp/gl/framebuffer.cpp
++++ b/MobileGlues-cpp/gl/framebuffer.cpp
+@@ -6,6 +6,7 @@
+ // End of Source File Header
+ 
+ #include "framebuffer.h"
++#include "texture.h"
+ #include "../egl/context.h"
+ #include <mutex>
+ #include <memory>
+@@ -101,6 +102,17 @@ bool mg_draw_framebuffer_all_none() {
+     const auto it = framebuffers.find(current_draw_fbo);
+     return it != framebuffers.end() && it->second->color_attachments_all_none;
+ }
++bool mg_draw_framebuffer_has_texture(GLuint texture) {
++    if (texture == 0 || current_draw_fbo == 0) return false;
++    const auto it = framebuffers.find(current_draw_fbo);
++    if (it == framebuffers.end()) return false;
++    for (const attachment_t& a : it->second->color_attachments) {
++        if (a.kind == attach_kind_t::None) continue;
++        if (a.kind == attach_kind_t::Renderbuffer) continue;
++        if (a.texture == texture) return true;
++    }
++    return false;
++}
+ void ensure_max_attachments() {
+     // The fallback is used but no longer cached. A query made with no context
+     // current answers nothing, and writing 8 into the static then meant 8 for the
+@@ -266,6 +278,30 @@ void update_attachment(GLenum target, GLenum attachment, const attachment_t& wha
+ // anything that skips it has to put things back first.
+ void restore_home_attachments(framebuffer_t& fbo);
+ 
++// ES 3.2 의 glFramebufferTexture 를 그 아래 호스트에서도 되게 한다.
++//
++// ⚠️ ANGLE 은 백엔드와 무관하게 3.2 API 심볼을 전부 내보낸다. 그래서 dlsym 은 성공하고
++//    호출도 되지만, ES 3.0 컨텍스트에서는 거부되어 **아무것도 붙지 않는다.**
++//    붙은 줄 알고 진행하면 그 패스는 아무 데도 그리지 않는다.
++//    안드로이드(호스트 3.2)에서는 절대 드러나지 않고, ANGLE Metal(3.0)에서만 터진다.
++static void mg_attach_whole_texture(GLenum target, GLenum attachment,
++                                    GLuint texture, GLint level) {
++    if (hardware && hardware->es_version >= 320) {
++        GLES.glFramebufferTexture(target, attachment, texture, level);
++        return;
++    }
++    // 레이어드 렌더링은 3.2 미만에서 불가능하다. 비레이어드 텍스처라면 해당 레벨 하나를
++    // 붙이는 것과 같은 의미다.
++    GLenum textarget = GL_TEXTURE_2D;
++    if (TextureObject* obj = mgGetTexObjectByID(texture))
++        textarget = ConvertTextureTargetToGLEnum(obj->target);
++
++    if (textarget == GL_TEXTURE_2D_ARRAY || textarget == GL_TEXTURE_3D)
++        GLES.glFramebufferTextureLayer(target, attachment, texture, level, 0);
++    else
++        GLES.glFramebufferTexture2D(target, attachment, textarget, texture, level);
++}
++
+ // Put a recorded attachment onto a (possibly different) attachment point, the
+ // same way it originally arrived.
+ //
+@@ -281,7 +317,10 @@ void reattach(GLenum target, GLenum attachment, const attachment_t& a) {
+         GLES.glFramebufferTextureLayer(target, attachment, a.texture, a.level, a.layer);
+         break;
+     case attach_kind_t::TextureAll:
+-        GLES.glFramebufferTexture(target, attachment, a.texture, a.level);
++        // ⚠️ 여기가 빠지면 **월드는 그려지는데 손만 사라진다.** 월드는 draw buffer 구성이
++        //    고정이라 셔플이 없고, gbuffers_hand 는 별도 구성이라 셔플 → 복구를 탄다.
++        //    복구에서 어태치먼트가 유실되면 그 패스만 아무 데도 안 그린다.
++        mg_attach_whole_texture(target, attachment, a.texture, a.level);
+         break;
+     case attach_kind_t::Renderbuffer:
+         GLES.glFramebufferRenderbuffer(target, attachment, a.textarget, a.texture);
+@@ -302,7 +341,7 @@ void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLin
+     // whole texture, whatever its target is, and recording it as a 2D attachment
+     // meant a replay re-attached an array or 3D texture as if it were flat.
+     update_attachment(target, attachment, {attach_kind_t::TextureAll, 0, texture, level, 0});
+-    GLES.glFramebufferTexture(target, attachment, texture, level);
++    mg_attach_whole_texture(target, attachment, texture, level);
+ }
+ // Wrapped rather than passed straight through, so the record knows about them.
+ // While these bypassed the table, the record for an attachment they wrote stayed
+@@ -346,6 +385,7 @@ void restore_home_attachments(framebuffer_t& fbo) {
+ // defines, and moving them here quietly dropped three of the 500-odd aliases the
+ // library exports. An application that resolves glDeleteFramebuffersARB, as
+ // anything written against EXT_framebuffer_object does, got a null pointer.
++#ifndef __APPLE__
+ extern "C" {
+ GLAPI GLAPIENTRY void glDeleteFramebuffersARB(GLsizei n, const GLuint* names) __attribute__((alias("glDeleteFramebuffers")));
+ GLAPI GLAPIENTRY void glFramebufferRenderbufferARB(GLenum target, GLenum attachment, GLenum renderbuffertarget,
+@@ -353,6 +393,21 @@ GLAPI GLAPIENTRY void glFramebufferRenderbufferARB(GLenum target, GLenum attachm
+ GLAPI GLAPIENTRY void glFramebufferTextureLayerARB(GLenum target, GLenum attachment, GLuint texture, GLint level,
+                                                    GLint layer) __attribute__((alias("glFramebufferTextureLayer")));
+ }
++#else
++extern "C" {
++GLAPI GLAPIENTRY void glDeleteFramebuffersARB(GLsizei n, const GLuint* names) {
++    glDeleteFramebuffers(n, names);
++}
++GLAPI GLAPIENTRY void glFramebufferRenderbufferARB(GLenum target, GLenum attachment,
++                                                   GLenum renderbuffertarget, GLuint renderbuffer) {
++    glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
++}
++GLAPI GLAPIENTRY void glFramebufferTextureLayerARB(GLenum target, GLenum attachment, GLuint texture,
++                                                   GLint level, GLint layer) {
++    glFramebufferTextureLayer(target, attachment, texture, level, layer);
++}
++}
++#endif
+ 
+ // Wrapped for the same reason glReadPixels is: the source is the read framebuffer,
+ // and while FSR1 is on the application's framebuffer 0 is not where its frame is.
+diff --git a/MobileGlues-cpp/gl/framebuffer.h b/MobileGlues-cpp/gl/framebuffer.h
+index a25712d..617ee30 100644
+--- a/MobileGlues-cpp/gl/framebuffer.h
++++ b/MobileGlues-cpp/gl/framebuffer.h
+@@ -93,6 +93,12 @@ void InitFramebufferMap(size_t expectedSize);
+ // directly from another translation unit.
+ bool mg_draw_framebuffer_all_none();
+ 
++// 지금 바인드된 draw 프레임버퍼의 컬러 어태치먼트 중에 이 텍스처가 있는가.
++// glGenerateMipmap 우회(아래)가 "방금 그린 대상에 다시 밉맵을 건다" 는 위험한
++// 경우만 골라내려고 쓴다. 렌더버퍼는 제외한다 -- 이름 공간이 텍스처와 달라서
++// 번호가 겹치면 엉뚱하게 맞아버린다.
++bool mg_draw_framebuffer_has_texture(GLuint texture);
++
+ // Points the backend READ binding at the FSR1 render target for as long as it
+ // lives, and only when the application is reading its own framebuffer 0 while
+ // FSR1 is on. A no-op in every other case.
+diff --git a/MobileGlues-cpp/gl/getter.cpp b/MobileGlues-cpp/gl/getter.cpp
+index 485d2ca..3cdee17 100644
+--- a/MobileGlues-cpp/gl/getter.cpp
++++ b/MobileGlues-cpp/gl/getter.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: LGPL-2.1-only
+ // End of Source File Header
+ 
++#include <cstdlib>
+ #include "getter.h"
+ #include "enable.h"
+ #include "../egl/context.h"
+@@ -25,6 +26,15 @@
+ 
+ Version GLVersion;
+ 
++#define MG_LOG_VERSION_ANSWER(which, branch, value)                                   \
++    do {                                                                              \
++        static int mg_version_logs = 0;                                               \
++        if (mg_version_logs < 8) {                                                    \
++            mg_version_logs++;                                                        \
++            LOG_W_FORCE("MGVER GL_%s_VERSION -> %d  (분기=%s)", which, (int)(value), branch) \
++        }                                                                             \
++    } while (0)
++
+ namespace {
+ // See mg_set_gl_error in gl/mg.h for why this exists and why it is per thread.
+ thread_local GLenum g_frontend_error = GL_NO_ERROR;
+@@ -79,21 +89,42 @@ void glGetIntegerv(GLenum pname, GLint* params) {
+         // to the driver, which knows the real answer.
+         if (g_current_ctx && g_current_ctx->client_type == EGL_OPENGL_API) {
+             (*params) = g_current_ctx->granted_major;
+-        } else if (g_current_ctx) {
+-            GLES.glGetIntegerv(GL_MAJOR_VERSION, params);
++            MG_LOG_VERSION_ANSWER("MAJOR", "granted(desktop)", *params);
+         } else {
++            // ⚠️ 드라이버(호스트 ES)로 넘기지 않는다. 그러면 GL_VERSION 문자열이 말하는
++            //    데스크톱 버전과 답이 달라지고, 정수 질의를 먼저 믿는 로더는 GL 3.3+ 를
++            //    통째로 못 쓰게 된다(위 설명 참고).
+             (*params) = GLVersion.Major;
++            MG_LOG_VERSION_ANSWER("MAJOR", g_current_ctx ? "GLVersion(es-ctx)" : "GLVersion(no-ctx)", *params);
+         }
+         break;
+     case GL_MINOR_VERSION:
+         if (g_current_ctx && g_current_ctx->client_type == EGL_OPENGL_API) {
+             (*params) = g_current_ctx->granted_minor;
+-        } else if (g_current_ctx) {
+-            GLES.glGetIntegerv(GL_MINOR_VERSION, params);
++            MG_LOG_VERSION_ANSWER("MINOR", "granted(desktop)", *params);
+         } else {
+-            (*params) = GLVersion.Minor;
++            (*params) = GLVersion.Minor;   // 위와 같은 이유
++            MG_LOG_VERSION_ANSWER("MINOR", g_current_ctx ? "GLVersion(es-ctx)" : "GLVersion(no-ctx)", *params);
++        }
++        break;
++    case GL_MAX_TEXTURE_SIZE: {
++        int es_params = 4096;
++        GLES.glGetIntegerv(pname, &es_params);
++        CHECK_GL_ERROR
++        // MG_MAX_TEXTURE_DIM 이 있으면 그보다 크게 답하지 않는다. 호출자(마인크래프트)는
++        // 이 값을 **아틀라스를 만들기 전에** 읽어서 스티처 한도로 쓰므로, 여기서 낮추면
++        // 힙 밖 NativeImage 자체가 작아진다. (빌드 스크립트의 패치 14b 주석 참고)
++        static const long forced = [] {
++            const char* v = getenv("MG_MAX_TEXTURE_DIM");
++            return v ? strtol(v, nullptr, 10) : 0L;
++        }();
++        if (forced > 0 && es_params > forced) {
++            LOG_W_FORCE("MGTEX GL_MAX_TEXTURE_SIZE %d -> %ld (상한 강제)", es_params, forced)
++            es_params = (int)forced;
+         }
++        (*params) = es_params;
+         break;
++    }
+     case GL_MAX_TEXTURE_IMAGE_UNITS: {
+         int es_params = 16;
+         GLES.glGetIntegerv(pname, &es_params);
+diff --git a/MobileGlues-cpp/gl/gl_native.cpp b/MobileGlues-cpp/gl/gl_native.cpp
+index 9c0ec31..f98f991 100644
+--- a/MobileGlues-cpp/gl/gl_native.cpp
++++ b/MobileGlues-cpp/gl/gl_native.cpp
+@@ -11,6 +11,7 @@
+ #include "log.h"
+ #include "../gles/loader.h"
+ #include "mg.h"
++#include "framebuffer.h"
+ #include <GLES3/gl32.h>
+ 
+ #define DEBUG 0
+@@ -65,7 +66,26 @@ NATIVE_FUNCTION_HEAD(void, glFlush) NATIVE_FUNCTION_END_NO_RETURN(void, glFlush)
+ //NATIVE_FUNCTION_HEAD(void, glFramebufferTexture2D, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) NATIVE_FUNCTION_END_NO_RETURN(void, glFramebufferTexture2D, target,attachment,textarget,texture,level)
+ NATIVE_FUNCTION_HEAD(void, glFrontFace, GLenum mode) NATIVE_FUNCTION_END_NO_RETURN(void, glFrontFace, mode)
+ //NATIVE_FUNCTION_HEAD(void, glGenBuffers, GLsizei n, GLuint *buffers) NATIVE_FUNCTION_END_NO_RETURN(void, glGenBuffers, n,buffers)
+-NATIVE_FUNCTION_HEAD(void, glGenerateMipmap, GLenum target) NATIVE_FUNCTION_END_NO_RETURN(void, glGenerateMipmap, target)
++static GLenum mg_texture_binding_of(GLenum target) {
++    switch (target) {
++        case GL_TEXTURE_2D:       return GL_TEXTURE_BINDING_2D;
++        case GL_TEXTURE_3D:       return GL_TEXTURE_BINDING_3D;
++        case GL_TEXTURE_2D_ARRAY: return GL_TEXTURE_BINDING_2D_ARRAY;
++        case GL_TEXTURE_CUBE_MAP: return GL_TEXTURE_BINDING_CUBE_MAP;
++        default:                  return 0;
++    }
++}
++
++extern "C" GLAPI GLAPIENTRY void glGenerateMipmap(GLenum target) {
++    GLenum binding = mg_texture_binding_of(target);
++    if (binding != 0) {
++        GLint tex = 0;
++        GLES.glGetIntegerv(binding, &tex);
++        if (mg_draw_framebuffer_has_texture((GLuint)tex)) GLES.glFlush();
++    }
++    GLES.glGenerateMipmap(target);
++    CHECK_GL_ERROR
++}
+ NATIVE_FUNCTION_HEAD(void, glGenFramebuffers, GLsizei n, GLuint *framebuffers) NATIVE_FUNCTION_END_NO_RETURN(void, glGenFramebuffers, n,framebuffers)
+ NATIVE_FUNCTION_HEAD(void, glGenRenderbuffers, GLsizei n, GLuint *renderbuffers) NATIVE_FUNCTION_END_NO_RETURN(void, glGenRenderbuffers, n,renderbuffers)
+ NATIVE_FUNCTION_HEAD(void, glGenTextures, GLsizei n, GLuint *textures) NATIVE_FUNCTION_END_NO_RETURN(void, glGenTextures, n,textures)
+diff --git a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+index c7eee88..7ab85a8 100644
+--- a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
++++ b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+@@ -248,8 +248,21 @@ std::string process_uniform_declarations(const std::string& glslCode) {
+ 
+     result.reserve(glslCode.length());
+ 
++    // "uniform" 은 **낱말일 때만** 선언의 시작이다.
++    // 앞뒤가 식별자 문자면 그건 이름의 일부다 — SPIRV-Cross 가 내는
++    // `_uniform_instance_00_01` 같은 이름이 그렇다. 그걸 선언으로 잘못 보면
++    // 다음 ';' 까지를 통째로 갈아엎어 코드가 깨진다(마인크래프트 26.3 에서 실측:
++    // `if (_uniform_instance_00_01.Flag) { ... }` → `if (_uniform _instance_00_01 ;`).
++    auto is_ident_char = [](char c) {
++        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
++    };
++
+     while (scan_pos < length) {
+-        if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
++        const bool is_uniform_token =
++            glslCode.compare(scan_pos, 7, "uniform") == 0 &&
++            (scan_pos == 0 || !is_ident_char(glslCode[scan_pos - 1])) &&
++            (scan_pos + 7 >= length || !is_ident_char(glslCode[scan_pos + 7]));
++        if (is_uniform_token) {
+             if (scan_pos > chunk_start) {
+                 result.append(glslCode, chunk_start, scan_pos - chunk_start);
+             }
+@@ -346,6 +359,108 @@ std::string processOutColorLocations(const std::string& glslCode) {
+     return std::regex_replace(glslCode, pattern, replacement);
+ }
+ 
++
++// ── 프래그먼트 출력 배열의 동적 인덱싱 풀기 ────────────────────────────────
++//
++// GLSL ES 는 `out vec4 color[N]` 을 **상수로만** 인덱싱하게 한다(S0015). 그런데
++// 마인크래프트 26.3 의 셰이더는 상수 범위 반복문 안에서 변수로 인덱싱한다:
++//
++//     for (int attachmentIndex = 0; attachmentIndex < 2; attachmentIndex++)
++//         for (int i_1 = 0; i_1 < 4; i_1++)
++//             _frag_output_00[attachmentIndex][i_1] = coefficients[...];
++//
++// 범위가 리터럴이므로 펼치면 인덱스가 상수가 된다. 출력 배열을 건드리는 반복문만,
++// 그리고 SPIRV-Cross 가 내는 정형화된 형태일 때만 손댄다 — 그 외에는 그대로 둔다.
++static std::vector<std::string> flame_out_array_names(const std::string& code) {
++    static const std::regex decl(
++        R"(out\s+(?:highp\s+|mediump\s+|lowp\s+)?\w+\s+(\w+)\s*\[\s*\d+\s*\]\s*;)");
++    std::vector<std::string> names;
++    for (std::sregex_iterator it(code.begin(), code.end(), decl), end; it != end; ++it)
++        names.push_back((*it)[1].str());
++    return names;
++}
++
++static bool flame_body_indexes_out_array(const std::string& body, const std::vector<std::string>& names,
++                                         const std::string& var) {
++    if (body.find(var) == std::string::npos) return false;
++    for (const auto& n : names) {
++        size_t at = body.find(n + "[");
++        if (at != std::string::npos) return true;
++    }
++    return false;
++}
++
++static std::string flame_replace_word(const std::string& text, const std::string& word, const std::string& with) {
++    std::string out;
++    out.reserve(text.size());
++    size_t pos = 0;
++    auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
++    while (true) {
++        size_t at = text.find(word, pos);
++        if (at == std::string::npos) {
++            out.append(text, pos, std::string::npos);
++            return out;
++        }
++        const bool left = at > 0 && ident(text[at - 1]);
++        const size_t after = at + word.size();
++        const bool right = after < text.size() && ident(text[after]);
++        out.append(text, pos, at - pos);
++        out.append((left || right) ? word : with);
++        pos = after;
++    }
++}
++
++std::string unroll_out_array_loops(const std::string& glslCode) {
++    const std::vector<std::string> names = flame_out_array_names(glslCode);
++    if (names.empty()) return glslCode;
++
++    // `for (int NAME = 0; NAME < K; NAME++)` — SPIRV-Cross 가 내는 형태 그대로.
++    static const std::regex loop(
++        R"(for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*(\d+)\s*;\s*(?:\1\s*\+\+|\+\+\s*\1)\s*\)\s*\{)");
++
++    std::string code = glslCode;
++    for (int pass = 0; pass < 8; ++pass) {   // 중첩 반복문은 바깥부터 한 겹씩
++        std::smatch m;
++        bool changed = false;
++        size_t from = 0;
++        while (std::regex_search(code.cbegin() + from, code.cend(), m, loop)) {
++            const size_t head = from + m.position(0);
++            const size_t body_start = from + m.position(0) + m.length(0);   // '{' 다음
++            const std::string var = m[1].str();
++            const int count = std::stoi(m[2].str());
++
++            // 짝이 맞는 '}' 찾기
++            int depth = 1;
++            size_t i = body_start;
++            for (; i < code.size() && depth > 0; ++i) {
++                if (code[i] == '{') ++depth;
++                else if (code[i] == '}') --depth;
++            }
++            if (depth != 0) break;
++            const size_t body_end = i - 1;   // '}' 위치
++            const std::string body = code.substr(body_start, body_end - body_start);
++
++            if (count > 0 && count <= 64 && flame_body_indexes_out_array(body, names, var)) {
++                std::string unrolled;
++                unrolled.reserve(body.size() * count + 16);
++                for (int k = 0; k < count; ++k) {
++                    unrolled += "\n{";
++                    unrolled += flame_replace_word(body, var, std::to_string(k));
++                    unrolled += "}\n";
++                }
++                code = code.substr(0, head) + unrolled + code.substr(body_end + 1);
++                changed = true;
++                from = head + unrolled.size();
++            } else {
++                from = body_end;
++            }
++            if (from >= code.size()) break;
++        }
++        if (!changed) break;
++    }
++    return code;
++}
++
+ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
+                          int& return_code) {
+     std::string sha256_string(glsl_code);
+@@ -364,6 +479,7 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
+     std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
+     if (return_code >= 0 && !converted.empty()) {
+         converted = process_uniform_declarations(converted);
++        converted = unroll_out_array_loops(converted);
+         Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
+     }
+ 
+@@ -495,15 +611,86 @@ void process_sampler_buffer(std::string& source) { // a simplized version, shoul
+         return;
+     }
+ 
++    // FlameLauncher: 버퍼 샘플러 **이름을 먼저 모은다** — 같은 셰이더의 평범한
++    // sampler2D texelFetch 까지 고쳐 쓰면 안 된다.
++    std::vector<std::string> flame_buffers;
++    {
++        static const std::regex decl(R"(isamplerBuffer\s+(\w+))");
++        for (std::sregex_iterator it(source.begin(), source.end(), decl), e; it != e; ++it) {
++            flame_buffers.push_back((*it)[1].str());
++        }
++    }
++
+     size_t pos = 0;
+     while ((pos = source.find("isamplerBuffer", pos)) != std::string::npos) {
+         source.replace(pos, 14, "isampler2D");
+-        pos += 11;
++        pos += 10;
+     }
+ 
+-    std::regex pattern(R"(texelFetch\s*\(\s*(\w+)\s*,\s*([^)]+?)\s*\))");
+-    source = std::regex_replace(source, pattern,
+-                                "texelFetch($1, ivec2(($2) % u_BufferTexWidth, ($2) / u_BufferTexWidth), 0)");
++    // FlameLauncher: 인자는 **괄호 깊이**로 자른다(정규식으로는 중첩 괄호를 못 센다).
++    {
++        auto flame_trim = [](const std::string& v) {
++            const size_t b = v.find_first_not_of(" \t\r\n");
++            if (b == std::string::npos) return std::string();
++            return v.substr(b, v.find_last_not_of(" \t\r\n") - b + 1);
++        };
++        auto flame_ident = [](char c) {
++            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
++        };
++        const std::string kCall = "texelFetch";
++        std::string out;
++        out.reserve(source.size());
++        size_t at = 0;
++        while (true) {
++            const size_t call = source.find(kCall, at);
++            if (call == std::string::npos) {
++                out.append(source, at, std::string::npos);
++                break;
++            }
++            const size_t after = call + kCall.size();
++            const size_t open = source.find_first_not_of(" \t\r\n", after);
++            const bool usable = (call == 0 || !flame_ident(source[call - 1])) &&
++                                open != std::string::npos && source[open] == '(';
++            if (!usable) {
++                out.append(source, at, after - at);
++                at = after;
++                continue;
++            }
++            std::vector<std::string> args;
++            size_t i = open + 1, start = i;
++            int depth = 1;
++            for (; i < source.size(); ++i) {
++                const char c = source[i];
++                if (c == '(') {
++                    ++depth;
++                } else if (c == ')') {
++                    if (--depth == 0) break;
++                } else if (c == ',' && depth == 1) {
++                    args.push_back(source.substr(start, i - start));
++                    start = i + 1;
++                }
++            }
++            if (depth != 0) {   // 괄호가 안 닫혔다 — 건드리지 않는다
++                out.append(source, at, after - at);
++                at = after;
++                continue;
++            }
++            args.push_back(source.substr(start, i - start));
++            const size_t end = i;   // ')' 위치
++            const std::string name = args.empty() ? std::string() : flame_trim(args[0]);
++            const bool is_buffer = args.size() == 2 &&
++                std::find(flame_buffers.begin(), flame_buffers.end(), name) != flame_buffers.end();
++            if (is_buffer) {
++                out.append(source, at, call - at);
++                // int() 로 감싼다 — 색인이 uint 여도 u_BufferTexWidth(int) 와 섞이지 않는다.
++                out += "texelFetch(" + name + ", bufferCoords(int(" + flame_trim(args[1]) + ")), 0)";
++            } else {
++                out.append(source, at, end + 1 - at);
++            }
++            at = end + 1;
++        }
++        source = out;
++    }
+ 
+     const char* boundaryProtection = R"(
+ ivec2 bufferCoords(int index) {
+@@ -724,7 +911,7 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
+     TBuiltInResource TBuiltInResource_resources = InitResources();
+ 
+     if (!shader.parse(&TBuiltInResource_resources, glsl_version, true, EShMsgDefault)) {
+-        LOG_D("GLSL Compiling ERROR: \n%s", shader.getInfoLog())
++        LOG_W_FORCE("[Flame] glslang 컴파일 실패:\n%s", shader.getInfoLog())
+         errc = -1;
+         return {};
+     }
+@@ -734,7 +921,7 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
+     program.addShader(&shader);
+ 
+     if (!program.link(EShMsgDefault)) {
+-        LOG_D("Shader Linking ERROR: %s", program.getInfoLog())
++        LOG_W_FORCE("[Flame] glslang 링크 실패: %s", program.getInfoLog())
+         errc = -1;
+         return {};
+     }
+diff --git a/MobileGlues-cpp/gl/log.h b/MobileGlues-cpp/gl/log.h
+index 0e67498..277bb44 100644
+--- a/MobileGlues-cpp/gl/log.h
++++ b/MobileGlues-cpp/gl/log.h
+@@ -100,14 +100,14 @@ void log_unique_function(const char* func_name);
+         write_log(__VA_ARGS__);                                                                                        \
+     }
+ #define LOG_E(...)                                                                                                     \
+-    if (DEBUG || GLOBAL_DEBUG) {                                                                                       \
++    if (true) {                                                                                                        \
+         __android_log_print(ANDROID_LOG_ERROR, RENDERERNAME, __VA_ARGS__);                                             \
+         printf(__VA_ARGS__);                                                                                           \
+         printf("\n");                                                                                                  \
+         write_log(__VA_ARGS__);                                                                                        \
+     }
+ #define LOG_F(...)                                                                                                     \
+-    if (DEBUG || GLOBAL_DEBUG) {                                                                                       \
++    if (true) {                                                                                                        \
+         __android_log_print(ANDROID_LOG_FATAL, RENDERERNAME, __VA_ARGS__);                                             \
+         printf(__VA_ARGS__);                                                                                           \
+         printf("\n");                                                                                                  \
+diff --git a/MobileGlues-cpp/gl/texture.cpp b/MobileGlues-cpp/gl/texture.cpp
+index f4dd2f7..74f0cc9 100644
+--- a/MobileGlues-cpp/gl/texture.cpp
++++ b/MobileGlues-cpp/gl/texture.cpp
+@@ -878,6 +878,154 @@ void glTexImage1D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+     CHECK_GL_ERROR
+ }
+ 
++
++// ── 거대 텍스처 축소 ───────────────────────────────────────────────────────
++// (자세한 사정은 빌드 스크립트의 패치 15 주석 참고)
++
++#ifdef __APPLE__
++#include <os/proc.h>
++#endif
++
++namespace {
++
++/// 이 텍스처를 몇 단계(2의 거듭제곱) 줄여서 잡았는지. 0 이면 원본 그대로.
++std::unordered_map<GLuint, int>& mg_shrink_table() {
++    static std::unordered_map<GLuint, int> table;
++    return table;
++}
++
++int mg_shrink_of(GLuint texture) {
++    auto& table = mg_shrink_table();
++    auto it = table.find(texture);
++    return it == table.end() ? 0 : it->second;
++}
++
++/// 픽셀 하나의 바이트 수. 모르면 0 — 그러면 최근접 샘플로 떨어진다.
++int mg_bytes_per_pixel(GLenum format, GLenum type) {
++    int channels;
++    switch (format) {
++        case GL_RED: case GL_RED_INTEGER: case GL_ALPHA: case GL_LUMINANCE: channels = 1; break;
++        case GL_RG:  case GL_RG_INTEGER:  case GL_LUMINANCE_ALPHA:          channels = 2; break;
++        case GL_RGB: case GL_RGB_INTEGER: case GL_BGR:                      channels = 3; break;
++        case GL_RGBA: case GL_RGBA_INTEGER: case GL_BGRA:                   channels = 4; break;
++        default: return 0;
++    }
++    switch (type) {
++        case GL_UNSIGNED_BYTE: case GL_BYTE: return channels;
++        default: return 0;   // 패킹 타입(5_6_5 등)은 픽셀 단위로 못 쪼갠다
++    }
++}
++
++/// 이 할당을 감당하려면 몇 단계 줄여야 하는가.
++int mg_shrink_needed(GLsizei width, GLsizei height, int bpp) {
++    if (width <= 0 || height <= 0) return 0;
++    if (bpp <= 0) bpp = 4;
++
++    // 강제 상한(디버그·재현용). 0 이거나 없으면 아래의 여유 기반 판단으로 간다.
++    static const long forced = [] {
++        const char* v = getenv("MG_MAX_TEXTURE_DIM");
++        return v ? strtol(v, nullptr, 10) : 0L;
++    }();
++    if (forced > 0) {
++        int shift = 0;
++        while ((width >> shift) > forced || (height >> shift) > forced) {
++            if (++shift >= 4) break;
++        }
++        if (shift > 0) {
++            LOG_W_FORCE("MGTEX %dx%d -> %dx%d (상한 %ld 강제)",
++                        width, height, width >> shift, height >> shift, forced)
++        }
++        return shift;
++    }
++
++#ifdef __APPLE__
++    size_t available = os_proc_available_memory();
++    if (available == 0) return 0;
++    // 업로드 버퍼와 GPU 사본이 겹치는 순간이 있으므로 두 배로 본다. 남은 여유를
++    // 통째로 쓸 수는 없으니 60% 까지만 허용한다 — 나머지는 자바 힙이 계속 쓴다.
++    size_t budget = available / 10 * 6;
++    size_t need = static_cast<size_t>(width) * static_cast<size_t>(height) * bpp * 2;
++    int shift = 0;
++    while (need > budget && shift < 3) {
++        shift++;
++        need >>= 2;
++    }
++    if (shift > 0) {
++        LOG_W_FORCE("MGTEX %dx%d 는 남은 여유 %zuMB 로 감당이 안 됩니다 — %dx%d 로 줄입니다",
++                    width, height, available >> 20, width >> shift, height >> shift)
++    }
++    return shift;
++#else
++    return 0;
++#endif
++}
++
++/// 언팩 상태를 읽어 원본 행 간격을 구하고, 우리 버퍼를 넣는 동안 기본값으로 돌려 둔다.
++struct mg_unpack_scope {
++    GLint row_length = 0, skip_rows = 0, skip_pixels = 0, alignment = 4;
++    mg_unpack_scope() {
++        GLES.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++        GLES.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++        GLES.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++        GLES.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++        GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++        GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++        GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++        GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    }
++    ~mg_unpack_scope() {
++        GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++        GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++        GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++        GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++    }
++};
++
++/// 2^shift 블록 평균으로 줄인 사본. bpp 를 모르면 최근접 샘플.
++/// 반환 버퍼는 tight-packed 다 — 부르는 쪽이 mg_unpack_scope 를 잡고 있어야 한다.
++std::vector<unsigned char> mg_downscale(const void* pixels, GLsizei width, GLsizei height, int shift,
++                                        int bpp, const mg_unpack_scope& unpack) {
++    const int step = 1 << shift;
++    // ⚠️ 1 픽셀짜리 업로드처럼 블록보다 작은 경우가 있다. 0 으로 내려보내면 그 자리를
++    //    통째로 버리게 되므로(실측: "1x1 업로드를 넣지 못했습니다") 최소 1 로 잡고,
++    //    블록이 원본을 넘어가면 넘어간 만큼 잘라서 평균낸다.
++    const GLsizei out_w = std::max<GLsizei>(1, width >> shift);
++    const GLsizei out_h = std::max<GLsizei>(1, height >> shift);
++    std::vector<unsigned char> out(static_cast<size_t>(out_w) * out_h * bpp);
++
++    const GLsizei src_row_pixels = unpack.row_length > 0 ? unpack.row_length : width;
++    size_t src_stride = static_cast<size_t>(src_row_pixels) * bpp;
++    if (unpack.alignment > 1) {
++        size_t a = static_cast<size_t>(unpack.alignment);
++        src_stride = (src_stride + a - 1) / a * a;
++    }
++    const auto* base = static_cast<const unsigned char*>(pixels)
++                     + static_cast<size_t>(unpack.skip_rows) * src_stride
++                     + static_cast<size_t>(unpack.skip_pixels) * bpp;
++
++    for (GLsizei y = 0; y < out_h; ++y) {
++        for (GLsizei x = 0; x < out_w; ++x) {
++            unsigned char* dst = out.data() + (static_cast<size_t>(y) * out_w + x) * bpp;
++            const GLsizei y0 = y * step, y1 = std::min<GLsizei>(y0 + step, height);
++            const GLsizei x0 = x * step, x1 = std::min<GLsizei>(x0 + step, width);
++            const unsigned count = static_cast<unsigned>((y1 - y0) * (x1 - x0));
++            for (int c = 0; c < bpp; ++c) {
++                unsigned sum = 0;
++                for (GLsizei sy = y0; sy < y1; ++sy) {
++                    const auto* row = base + static_cast<size_t>(sy) * src_stride;
++                    for (GLsizei sx = x0; sx < x1; ++sx) {
++                        sum += row[static_cast<size_t>(sx) * bpp + c];
++                    }
++                }
++                dst[c] = static_cast<unsigned char>(count ? sum / count : 0);
++            }
++        }
++    }
++    return out;
++}
++
++} // namespace
++
+ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid* pixels) {
+     LOG()
+@@ -932,6 +1080,47 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+     }
+ 
+     GET_TEXTURE_OBJECT(target);
++
++    // 여기서만 줄인다 — 2D 레벨 0, 픽셀 버퍼 없이. (패치 15)
++    std::vector<unsigned char> shrunk;
++    const void* upload = fix.pixels;
++    if (target == GL_TEXTURE_2D && level == 0) {
++        GLint pbo = 0;
++        GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
++        const int bpp = mg_bytes_per_pixel(format, type);
++        const int shift = pbo != 0 ? 0 : mg_shrink_needed(width, height, bpp);
++        if (shift > 0) {
++            if (fix.has_data() && fix.pixels != nullptr && bpp > 0) {
++                mg_unpack_scope unpack;
++                shrunk = mg_downscale(fix.pixels, width, height, shift, bpp, unpack);
++                upload = shrunk.data();
++                width >>= shift;
++                height >>= shift;
++                GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, upload);
++                mg_shrink_table()[tex->texture] = shift;
++                tex->target = ConvertGLEnumToTextureTarget(target);
++                tex->internal_format = internalFormat;
++                tex->width = width;
++                tex->height = height;
++                tex->depth = 1;
++                tex->swizzle_param[0] = GL_RED;
++                tex->swizzle_param[1] = GL_GREEN;
++                tex->swizzle_param[2] = GL_BLUE;
++                tex->swizzle_param[3] = GL_ALPHA;
++                tex->format = format;
++                CHECK_GL_ERROR
++                return;
++            }
++            if (!fix.has_data()) {   // 자리만 잡는 경우 — 마인크래프트 아틀라스가 이 길로 온다
++                width >>= shift;
++                height >>= shift;
++                mg_shrink_table()[tex->texture] = shift;
++            }
++        } else {
++            mg_shrink_table().erase(tex->texture);
++        }
++    }
++
+     tex->target = ConvertGLEnumToTextureTarget(target);
+     tex->internal_format = internalFormat;
+     tex->width = width;
+@@ -944,7 +1133,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+ 
+     tex->format = format;
+ 
+-    GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
++    GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, upload);
+ 
+     CHECK_GL_ERROR
+ }
+@@ -1033,6 +1222,8 @@ void glTexStorage1D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
+ }
+ 
+ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei width, GLsizei height) {
++    if (TextureObject* prev = mgGetTexObjectByTarget(target)) mg_shrink_table().erase(prev->texture);
++
+     LOG()
+     LOG_D("glTexStorage2D, target: %d, levels: %d, internalFormat: %d, width: "
+           "%d, height: %d",
+@@ -1421,6 +1612,29 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* p
+             }
+         }
+     }
++    // ES 3.1 미만에는 이 진입점이 없다 — 넘기면 값이 안 채워져 호출자가 0 을 읽는다.
++    // 우리가 들고 있는 텍스처 기록으로 답한다(위 설명 참고).
++    if (hardware && hardware->es_version < 310) {
++        if (TextureObject* obj = mgGetTexObjectByTarget(target)) {
++            switch (pname) {
++            case GL_TEXTURE_INTERNAL_FORMAT:
++                (*params) = (GLint)obj->internal_format;
++                return;
++            case GL_TEXTURE_WIDTH:
++                (*params) = nlevel(obj->width, level);
++                return;
++            case GL_TEXTURE_HEIGHT:
++                (*params) = nlevel(obj->height, level);
++                return;
++            case GL_TEXTURE_DEPTH:
++                (*params) = obj->depth > 0 ? nlevel(obj->depth, level) : 0;
++                return;
++            default:
++                break;
++            }
++        }
++    }
++
+     LOG_D("es.glGetTexLevelParameteriv,target: %s, level: %d, pname: %s", glEnumToString(target), level,
+           glEnumToString(pname))
+     GLES.glGetTexLevelParameteriv(target, level, pname, params);
+@@ -1478,6 +1692,30 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
+         return;
+     }
+ 
++    // 줄여 잡은 텍스처(패치 15)에는 좌표와 픽셀을 같은 비율로 줄여 넣는다.
++    TextureObject* shrunk_tex = (target == GL_TEXTURE_2D && level == 0) ? mgGetTexObjectByTarget(target) : nullptr;
++    const int shift = shrunk_tex ? mg_shrink_of(shrunk_tex->texture) : 0;
++    if (shift > 0) {
++        GLint pbo = 0;
++        GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
++        const int bpp = mg_bytes_per_pixel(fix.format, fix.type);
++        // 픽셀 버퍼 업로드나 쪼갤 수 없는 픽셀 포맷은 줄일 방법이 없다. 잘못된 크기로
++        // 넣느니 건너뛴다 — 그 자리는 비어 보이지만 프로세스는 살아 있다.
++        if (pbo != 0 || bpp <= 0) {
++            LOG_W_FORCE("MGTEX 줄인 텍스처에 %dx%d 업로드를 넣지 못했습니다 (pbo=%d bpp=%d)",
++                        width, height, pbo, bpp)
++            CHECK_GL_ERROR
++            return;
++        }
++        mg_unpack_scope unpack;
++        std::vector<unsigned char> small = mg_downscale(fix.pixels, width, height, shift, bpp, unpack);
++        GLES.glTexSubImage2D(target, level, xoffset >> shift, yoffset >> shift,
++                             std::max<GLsizei>(1, width >> shift), std::max<GLsizei>(1, height >> shift),
++                             fix.format, fix.type, small.data());
++        CHECK_GL_ERROR
++        return;
++    }
++
+     GLES.glTexSubImage2D(target, level, xoffset, yoffset, width, height, fix.format, fix.type, fix.pixels);
+ 
+     CHECK_GL_ERROR
+@@ -1558,6 +1796,10 @@ void glBindTexture(GLenum target, GLuint texture) {
+ }
+ 
+ void glDeleteTextures(GLsizei n, const GLuint* textures) {
++    if (textures) {
++        for (GLsizei i = 0; i < n; ++i) mg_shrink_table().erase(textures[i]);
++    }
++
+     LOG()
+     INIT_CHECK_GL_ERROR
+     GLES.glDeleteTextures(n, textures);
+diff --git a/MobileGlues-cpp/glx/lookup.cpp b/MobileGlues-cpp/glx/lookup.cpp
+index 7d1ab77..413049d 100644
+--- a/MobileGlues-cpp/glx/lookup.cpp
++++ b/MobileGlues-cpp/glx/lookup.cpp
+@@ -51,7 +51,12 @@ void* glXGetProcAddress(const char* name) {
+     LOG()
+     std::string real_func_name = handle_multidraw_func_name(std::string(name));
+ #ifdef __APPLE__
+-    return dlsym((void*)(~(uintptr_t)0), real_func_name.c_str());
++    // ⚠️ ~0 은 안드로이드에서만 RTLD_DEFAULT 다. 애플에서 (void*)-1 은 RTLD_NEXT 라
++    //    **이 레이어를 건너뛰고** 백엔드(ANGLE) 심볼을 돌려준다. RTLD_SELF 가 맞다:
++    //    우리 것을 먼저 찾고, 없으면 뒤 객체로 넘어간다.
++    void* proc = dlsym(RTLD_SELF, real_func_name.c_str());
++    if (!proc) proc = dlsym(RTLD_DEFAULT, real_func_name.c_str());
++    return proc;
+ #else
+ 
+     void* proc = nullptr;

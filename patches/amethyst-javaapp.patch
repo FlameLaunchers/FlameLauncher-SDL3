@@ -1,0 +1,71 @@
+diff --git a/JavaApp/src/launcher/net/kdt/pojavlaunch/uikit/UIKit.java b/JavaApp/src/launcher/net/kdt/pojavlaunch/uikit/UIKit.java
+index c8b0632..c428187 100644
+--- a/JavaApp/src/launcher/net/kdt/pojavlaunch/uikit/UIKit.java
++++ b/JavaApp/src/launcher/net/kdt/pojavlaunch/uikit/UIKit.java
+@@ -46,7 +46,7 @@ public class UIKit {
+     }
+ 
+     static {
+-        System.load(System.getenv("BUNDLE_PATH") + "/AngelAuraAmethyst");
++        System.load(System.getenv("BUNDLE_PATH") + "/FlameLauncher");
+     }
+ 
+ 
+diff --git a/JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java b/JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java
+index 859247e..bea5776 100644
+--- a/JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java
++++ b/JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java
+@@ -514,7 +514,7 @@ public class GLFW
+ 
+     static {
+         try {
+-            System.load(System.getenv("BUNDLE_PATH") + "/AngelAuraAmethyst");
++            System.load(System.getenv("BUNDLE_PATH") + "/FlameLauncher");
+         } catch (UnsatisfiedLinkError e) {
+             e.printStackTrace();
+         }
+@@ -584,7 +584,7 @@ public class GLFW
+         throw new UnsupportedOperationException();
+     }
+ 
+-    private static final SharedLibrary GLFW = new MacOSXLibraryDL("AngelAuraAmethyst", DynamicLinkLoader.RTLD_DEFAULT);
++    private static final SharedLibrary GLFW = new MacOSXLibraryDL("FlameLauncher", DynamicLinkLoader.RTLD_DEFAULT);
+ 
+ 
+     /** Contains the function pointers loaded from the glfw {@link SharedLibrary}. */
+@@ -809,6 +809,12 @@ public class GLFW
+         return GLFW_PLATFORM_X11;
+     }
+ 
++    /** LWJGL 3.4.1. 우리가 보고하는 플랫폼 하나만 지원한다고 답한다.
++     *  26.2 는 X11/Wayland 지원 여부를 물어 glfwInitHint(GLFW_PLATFORM, ...) 을 정한다. */
++    public static boolean glfwPlatformSupported(int platform) {
++        return platform == glfwGetPlatform();
++    }
++
+     @NativeType("GLFWwindow *")
+     public static long glfwGetCurrentContext() {
+         long __functionAddress = Functions.GetCurrentContext;
+@@ -831,6 +837,11 @@ public class GLFW
+ 
+     @Nullable
+     @NativeType("GLFWmonitor **")
++    /** LWJGL 3.4.1. 화면이 하나뿐이라 고정 이름을 돌려준다. */
++    public static String glfwGetMonitorName(@NativeType("GLFWmonitor *") long monitor) {
++        return "iOS Display";
++    }
++
+     public static PointerBuffer glfwGetMonitors() {
+         PointerBuffer pBuffer = PointerBuffer.allocateDirect(1);
+         pBuffer.put(glfwGetPrimaryMonitor());
+@@ -1088,7 +1099,9 @@ public class GLFW
+     public static void glfwPostEmptyEvent() {}
+ 
+     public static int glfwGetInputMode(@NativeType("GLFWwindow *") long window, int mode) {
+-        return internalGetWindow(window).inputModes.get(mode);
++        Integer value = internalGetWindow(window).inputModes.get(mode);
++        if (value != null) return value;
++        return mode == GLFW_CURSOR ? GLFW_CURSOR_NORMAL : GLFW_FALSE;
+     }
+ 
+     public static void glfwSetInputMode(@NativeType("GLFWwindow *") long window, int mode, int value) {
