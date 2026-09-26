@@ -49,6 +49,18 @@ echo "  버전 $ver"
 # 공통 옵션. 테스트·예제는 필요 없고, 우리는 정적/동적을 플랫폼마다 다르게 쓴다.
 COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF)
 
+# ⚠️ 타깃마다 **원본 클론의 사본**에 패치한다. 예전에는 두 타깃이 $WORK/src 를 같이 썼는데,
+#    `all` 로 돌리면 iOS 패치가 얹힌 트리 위에 안드로이드를 빌드하게 된다. iOS 래퍼는
+#    원본 함수를 `static flame_real_*` 로 바꾸고 공개 이름을 #ifdef SDL_PLATFORM_IOS 안에서
+#    다시 정의하므로, 안드로이드에서는 그 정의가 통째로 사라진다:
+#      ld.lld: version script assignment of 'SDL3_0.0.0' to symbol 'SDL_CreateWindowWithProperties'
+#              failed: symbol not defined
+#    (따로 돌릴 때는 드러나지 않아서 CI 에서 처음 걸렸다)
+fresh_src() {   # fresh_src <경로> — 패치 안 된 클론을 그 자리에 놓는다
+  rm -rf "$1"
+  cp -R "$WORK/src" "$1"
+}
+
 # ⚠️ iOS: UIKit 을 건드리는 진입점을 **메인 스레드로 넘긴다**.
 #
 #    SDL 의 uikit 백엔드는 UIWindow·UIScreen·CAEAGLLayer 를 만지므로 메인 스레드에서만
@@ -587,9 +599,10 @@ build_ios() {
   #    (`-Dorg.lwjgl.sdl.libname`) 으로 가리킬 수 있는 **파일**이어야 한다.
   #    앱 번들 안의 dylib 은 iOS 에서도 dlopen 되며, 이미 libmobileglues.dylib 을
   #    같은 방식으로 쓰고 있다. 정적으로 링크하면 이 경로가 막힌다.
-  patch_ios_mainthread "$WORK/src"
+  fresh_src "$WORK/ios-src"
+  patch_ios_mainthread "$WORK/ios-src"
 
-  cmake -S "$WORK/src" -B "$WORK/ios" "${COMMON[@]}" \
+  cmake -S "$WORK/ios-src" -B "$WORK/ios" "${COMMON[@]}" \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
     -DSDL_SHARED=ON -DSDL_STATIC=OFF > "$WORK/ios-cfg.log" 2>&1 || {
@@ -625,7 +638,7 @@ build_ios() {
   mkdir -p "$ROOT/Runtime/SDL3"
   cp "$lib" "$ROOT/Runtime/SDL3/libSDL3.dylib"
   mkdir -p "$ROOT/Runtime/SDL3/include"
-  cp -R "$WORK/src/include/SDL3" "$ROOT/Runtime/SDL3/include/"
+  cp -R "$WORK/ios-src/include/SDL3" "$ROOT/Runtime/SDL3/include/"
   echo "  완료: Runtime/SDL3/libSDL3.dylib ($(du -h "$lib" | cut -f1))"
 }
 
@@ -821,12 +834,13 @@ build_android() {
 
   # ⚠️ 안드로이드는 공유 라이브러리다. LWJGL 이 jniLibs 에서 dlopen 한다
   #    (lwjgl-sdl 의 natives jar 도 libSDL3.so 하나만 들고 있다).
-  patch_android_gles "$WORK/src"
+  fresh_src "$WORK/android-src"
+  patch_android_gles "$WORK/android-src"
 
   # ⚠️ 실패해도 조용하면 안 된다 — 로그로 받아 두고 실패할 때만 꼬리를 찍는다
   #    (CI 에서 cmake 구성이 깨졌는데 경고만 보이고 이유가 안 보였다).
   local log="$WORK/android-cmake.log"
-  if ! cmake -S "$WORK/src" -B "$WORK/android" "${COMMON[@]}" \
+  if ! cmake -S "$WORK/android-src" -B "$WORK/android" "${COMMON[@]}" \
     -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
     -DSDL_SHARED=ON -DSDL_STATIC=OFF >"$log" 2>&1; then
