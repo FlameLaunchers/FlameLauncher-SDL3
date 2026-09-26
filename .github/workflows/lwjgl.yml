@@ -66,17 +66,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.tag }}"
-          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          [ -n "$TAG" ] || TAG="$GITHUB_REF_NAME"
           REF="${{ inputs.lwjgl_ref || '3.4.3' }}"
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "LWJGL ${REF} natives" \
-            --notes "LWJGL \`${REF}\` natives for mobile, built from source (libffi is built too and linked statically into \`liblwjgl\`).
-
-| Asset | Contents |
-|---|---|
-| \`lwjgl-ios-arm64.zip\` | \`liblwjgl\`, \`liblwjgl_opengl\`, \`liblwjgl_stb\`, \`liblwjgl_tinyfd\` (.dylib) |
-| \`lwjgl-android-arm64-v8a.zip\` | \`liblwjgl\`, \`liblwjgl_opengl\`, \`liblwjgl_stb\`, \`liblwjgl_vma\` (.so) |
-
-The jar and the natives have to be the same version — a 3.4.3 jar on 3.4.1 natives dies in class init with \`UnsatisfiedLinkError: MemoryUtil.ngetPageSize()\`." \
+          # 릴리스 노트는 별도 파일이다 — 마크다운 표의 '|' 와 빈 줄이 YAML 안에서 살아남지 못한다.
+          sed "s|@REF@|$REF|g" .github/release-notes/lwjgl.md > notes.md
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "LWJGL $REF natives" --notes-file notes.md \
             || gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

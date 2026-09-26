@@ -60,17 +60,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.tag }}"
-          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
-          SDL_REF="${{ inputs.sdl_ref || 'release-3.4.16' }}"
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "SDL3 ${SDL_REF}" \
-            --notes "Built from SDL \`${SDL_REF}\` with the mobile patches in \`Scripts/build-sdl3.sh\` (see the README for what each one fixes).
-
-| Asset | Platform |
-|---|---|
-| \`libSDL3-ios-arm64.dylib\` | iOS arm64 |
-| \`libSDL3-android-arm64-v8a.so\` | Android arm64-v8a |
-
-Point LWJGL at it with \`-Dorg.lwjgl.sdl.libname=<absolute path>\`; \`org.lwjgl.sdl.SDL\` opens the file, it does not look for symbols." \
+          [ -n "$TAG" ] || TAG="$GITHUB_REF_NAME"
+          REF="${{ inputs.sdl_ref || 'release-3.4.16' }}"
+          # 릴리스 노트는 별도 파일이다 — 마크다운 표의 '|' 와 빈 줄이 YAML 안에서 살아남지 못한다.
+          sed "s|@REF@|$REF|g" .github/release-notes/sdl3.md > notes.md
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "SDL3 $REF" --notes-file notes.md \
             || gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
