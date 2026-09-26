@@ -29,10 +29,16 @@ jobs:
 
       - run: brew install ninja
 
+      # ⚠️ CMake 는 3.x 로 고정한다. brew 의 4.x 는 NDK 툴체인 파일이 선언한 옛
+      #    cmake_minimum_required 를 더는 받아주지 않아 안드로이드 구성이 깨진다.
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.6'
+
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: r27c
+          ndk-version: r28c
           local-cache: true
 
       - name: SDL3 빌드 (iOS · Android)

@@ -823,11 +823,18 @@ build_android() {
   #    (lwjgl-sdl 의 natives jar 도 libSDL3.so 하나만 들고 있다).
   patch_android_gles "$WORK/src"
 
-  cmake -S "$WORK/src" -B "$WORK/android" "${COMMON[@]}" \
+  # ⚠️ 실패해도 조용하면 안 된다 — 로그로 받아 두고 실패할 때만 꼬리를 찍는다
+  #    (CI 에서 cmake 구성이 깨졌는데 경고만 보이고 이유가 안 보였다).
+  local log="$WORK/android-cmake.log"
+  if ! cmake -S "$WORK/src" -B "$WORK/android" "${COMMON[@]}" \
     -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
-    -DSDL_SHARED=ON -DSDL_STATIC=OFF >/dev/null
-  cmake --build "$WORK/android" -j"$(sysctl -n hw.ncpu)" >/dev/null
+    -DSDL_SHARED=ON -DSDL_STATIC=OFF >"$log" 2>&1; then
+    echo "  ✗ cmake 구성 실패:"; tail -25 "$log"; return 1
+  fi
+  if ! cmake --build "$WORK/android" -j"$(sysctl -n hw.ncpu)" >"$log" 2>&1; then
+    echo "  ✗ 빌드 실패:"; tail -25 "$log"; return 1
+  fi
 
   local so="$WORK/android/libSDL3.so"
   [ -f "$so" ] || { echo "  ✗ libSDL3.so 가 없습니다"; return 1; }
